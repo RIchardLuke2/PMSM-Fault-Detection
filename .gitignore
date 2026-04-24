@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Runtime outputs
+data/*.csv
+outputs/models/*.keras
+outputs/models/*.h5
+outputs/models/*.pkl
+outputs/models/run_config.yaml
+outputs/plots/*.png
+outputs/metrics/*.csv
+outputs/metrics/*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
