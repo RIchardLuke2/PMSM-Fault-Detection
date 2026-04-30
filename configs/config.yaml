@@ -1,82 +1,48 @@
-# PMSM Inverter Fault Detection — Master Config
+seed: 42
 
 data:
-  raw_path: "data/pmsm_data.csv"
-  processed_dir: "data/processed"
+  raw_path: "data/converted_dataset.csv"
   features: ["Ia", "Ib", "VDC", "IDC", "T1", "T2", "T3", "VD"]
   target: "FDD"
-  test_size: 0.15          # held-out test set fraction
-  val_size: 0.15           # validation fraction (of train)
-  random_seed: 42
-
-preprocessing:
-  outlier_method: "iqr"    # iqr | zscore | none
-  outlier_threshold: 3.0
-  scaler: "standard"       # standard | minmax | robust
+  test_size: 0.15
+  val_size:  0.15
 
 windowing:
-  window_size: 64
-  stride: 32               # stride < window_size prevents leakage
-  flatten_for_ml: true     # for SVM/RF baselines
+  window_size: 10
+  stride: 5
 
 model:
-  type: "cnn_bilstm"       # cnn_bilstm | simple_cnn | simple_lstm
-  branches:
-    current:  ["Ia", "Ib"]
-    voltage:  ["VDC", "VD"]
-    thermal:  ["T1", "T2", "T3"]
-    dc:       ["IDC"]
-  filters: [64, 128]
+  num_classes: 9
+  filters: [64, 128, 64]
   lstm_units: 128
-  attention: true
-  residual: true
   dropout: 0.4
   l2_reg: 0.0001
-  num_classes: 9
+  attention: true
+  residual: true
+  branches:
+    current_branch: ["Ia", "Ib"]
+    voltage_branch: ["VDC", "VD"]
+    thermal_branch: ["T1", "T2", "T3"]
+    dc_branch:      ["IDC"]
 
 training:
   epochs: 100
-  batch_size: 64
+  batch_size: 256
   learning_rate: 0.001
   early_stopping_patience: 12
-  reduce_lr_patience: 6
+  reduce_lr_patience: 5
   reduce_lr_factor: 0.5
   class_weights: true
-  seed: 42
 
 robustness:
-  noise_levels: [0.0, 0.01, 0.05, 0.10, 0.20]
-  window_sizes: [32, 64, 128]
-  strides:      [16, 32, 64]
+  noise_levels:  [0.0, 0.01, 0.05, 0.10, 0.20, 0.50]
+  window_sizes:  [5, 10, 20, 30]
+  strides:       [1, 5, 10]
 
 paths:
-  scaler_path: "outputs/models/scaler.pkl"
-  encoder_path: "outputs/models/label_encoder.pkl"
-  model_path: "outputs/models/cnn_bilstm_best.keras"
-  config_path: "outputs/models/run_config.yaml"
-  plots_dir: "outputs/plots"
-  metrics_dir: "outputs/metrics"
-
-live_detection:
-  window_size: 64            # must match windowing.window_size
-  sample_rate_hz: 100        # simulated sensor sample rate
-  confidence_threshold: 0.80 # below this → "uncertain"
-  smoothing_window: 5        # majority-vote over last N predictions
-  fault_persistence: 3       # N consecutive fault preds before alert fires
-  unknown_fallback: true     # flag uncertain preds as "UNKNOWN"
-  log_to_file: true
-  log_path: "outputs/live_log.csv"
-  alert_modes: ["console"]   # console | file | mqtt (extend in alert_system.py)
-
-  # MQTT settings (only used if "mqtt" in alert_modes)
-  mqtt:
-    broker: "localhost"
-    port: 1883
-    topic: "pmsm/fault_alerts"
-
-  # Simulation settings (used when no real sensor feed)
-  simulation:
-    source_csv: "data/converted_dataset.csv"   # stream rows from this file
-    speed_multiplier: 1.0    # 1.0 = real-time, 10.0 = 10× faster
-    inject_fault_at: 300     # row index to inject fault for demo
-    inject_fault_class: "F3"
+  model_path:   "outputs/models/pmsm_cnn_bilstm.pt"
+  scaler_path:  "outputs/models/scaler.pkl"
+  encoder_path: "outputs/models/encoder.pkl"
+  config_save:  "outputs/models/config_saved.yaml"
+  plots_dir:    "outputs/plots"
+  metrics_dir:  "outputs/metrics"

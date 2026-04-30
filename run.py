@@ -1,165 +1,144 @@
 """
-run.py — End-to-end PMSM Inverter Fault Detection Pipeline
-===========================================================
-Usage:
-    python run.py                        # full pipeline
-    python run.py --skip-baselines       # skip baseline comparison
-    python run.py --skip-robustness      # skip robustness tests
-    python run.py --skip-explain         # skip explainability
-    python run.py --data-only            # only generate + preprocess data
+End-to-end pipeline:
+  python run.py                        # full pipeline
+  python run.py --skip-baselines       # skip slow baselines
+  python run.py --skip-robustness      # skip robustness tests
+  python run.py --inference-only       # load saved model and run inference
 """
 import argparse
 import os
 import sys
-import time
 
-# ── Make src/ and utils/ importable from project root ─────────────────────────
-sys.path.insert(0, os.path.dirname(__file__))
+# Ensure project root is in path (works when called from any cwd)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils.seed     import set_global_seed
-from utils.io_utils import load_config, save_config
-from utils.data_gen import generate_dataset
+import numpy as np
+import torch
+
+from utils.seed     import set_all_seeds
+from utils.io_utils import load_config, save_config, save_artifact
+from src.preprocessing import load_and_clean, encode_labels, fit_scaler, build_pipeline_data
+from src.model         import build_cnn_bilstm
+from src.training      import train_model, load_checkpoint, get_device
+from src.evaluation    import evaluate_model
+from src.baselines     import run_baselines
+from src.robustness    import noise_robustness, window_ablation
+from src.explainability import permutation_importance, compute_saliency
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="PMSM FDD Pipeline")
-    p.add_argument("--config",           default="configs/config.yaml")
-    p.add_argument("--skip-baselines",   action="store_true")
-    p.add_argument("--skip-robustness",  action="store_true")
-    p.add_argument("--skip-explain",     action="store_true")
-    p.add_argument("--data-only",        action="store_true")
-    p.add_argument("--generate-data",    action="store_true",
-                   help="Force re-generate synthetic dataset")
+    p.add_argument("--config",            default="configs/config.yaml")
+    p.add_argument("--skip-baselines",    action="store_true")
+    p.add_argument("--skip-robustness",   action="store_true")
+    p.add_argument("--skip-explainability", action="store_true")
+    p.add_argument("--inference-only",    action="store_true")
     return p.parse_args()
-
-
-def banner(msg: str):
-    w = 70
-    print("\n" + "═" * w)
-    print(f"  {msg}")
-    print("═" * w)
 
 
 def main():
     args = parse_args()
     cfg  = load_config(args.config)
-
-    # ── Reproducibility ───────────────────────────────────────────────────────
-    set_global_seed(cfg["data"]["random_seed"])
-
-    t_total = time.time()
-
-    # ── 0. Data generation ────────────────────────────────────────────────────
-    banner("STEP 0 — Data Generation")
-    raw_path = cfg["data"]["raw_path"]
-    if args.generate_data or not os.path.exists(raw_path):
-        generate_dataset(out_path=raw_path, seed=cfg["data"]["random_seed"])
-    else:
-        print(f"[Run] Found existing dataset at {raw_path} — skipping generation.")
-        print("      Pass --generate-data to force regeneration.")
-
-    if args.data_only:
-        print("[Run] --data-only flag set. Exiting after data generation.")
-        return
+    set_all_seeds(cfg.get("seed", 42))
 
     # ── 1. Preprocessing ──────────────────────────────────────────────────────
-    banner("STEP 1 — Preprocessing (leak-free)")
-    from src.preprocessing import run_preprocessing
-    data = run_preprocessing(cfg)
+    print("\n" + "="*60)
+    print("  STEP 1: Preprocessing")
+    print("="*60)
+    df      = load_and_clean(cfg)
+    encoder = encode_labels(df, cfg)
+    scaler  = fit_scaler(df, cfg)
+    data    = build_pipeline_data(df, encoder, scaler, cfg)
 
-    # Stash raw-scaled test split for window ablation
-    import numpy as np
-    from sklearn.preprocessing import LabelEncoder
-    from utils.io_utils import load_artifact
-    le: LabelEncoder = data["encoder"]
+    # Save artifacts
+    save_artifact(scaler,  cfg["paths"]["scaler_path"])
+    save_artifact(encoder, cfg["paths"]["encoder_path"])
+    save_config(cfg,       cfg["paths"]["config_save"])
 
-    # ── 2. Model building ─────────────────────────────────────────────────────
-    banner("STEP 2 — Building CNN-BiLSTM Model")
-    import tensorflow as tf
-    from src.model import build_cnn_bilstm
-    set_global_seed(cfg["training"]["seed"])  # re-seed before model init
-    model, branch_idxs = build_cnn_bilstm(cfg)
-    model.summary()
+    if args.inference_only:
+        print("\n[Run] Inference-only mode — loading saved model ...")
+        model, branch_idxs = build_cnn_bilstm(cfg)
+        device = get_device()
+        model  = load_checkpoint(model, cfg["paths"]["model_path"], device)
+    else:
+        # ── 2. Training ───────────────────────────────────────────────────────
+        print("\n" + "="*60)
+        print("  STEP 2: Training CNN-BiLSTM")
+        print("="*60)
+        model, branch_idxs = build_cnn_bilstm(cfg)
+        history = train_model(model, branch_idxs, data, cfg)
+        device  = get_device()
+        model   = load_checkpoint(model, cfg["paths"]["model_path"], device)
 
-    # ── 3. Training ───────────────────────────────────────────────────────────
-    banner("STEP 3 — Training")
-    from src.training import train_model
-    t0 = time.time()
-    history = train_model(model, branch_idxs, data, cfg)
-    print(f"[Run] Training finished in {(time.time()-t0)/60:.1f} min")
+    # ── 3. Evaluation ─────────────────────────────────────────────────────────
+    print("\n" + "="*60)
+    print("  STEP 3: Evaluation")
+    print("="*60)
+    val_metrics  = evaluate_model(model, branch_idxs, data, cfg, encoder,
+                                  device=None, tag="val")
+    test_metrics = evaluate_model(model, branch_idxs, data, cfg, encoder,
+                                  device=None, tag="test")
 
-    # Reload best checkpoint
-    best_model_path = cfg["paths"]["model_path"]
-    if os.path.exists(best_model_path):
-        print(f"[Run] Loading best checkpoint from {best_model_path}")
-        model = tf.keras.models.load_model(best_model_path)
+    import pandas as pd
+    combined = pd.DataFrame([
+        {"split": "val",  **val_metrics},
+        {"split": "test", **test_metrics},
+    ])
+    combined.to_csv(
+        os.path.join(cfg["paths"]["metrics_dir"], "final_metrics.csv"), index=False)
+    print("\n[Run] Final metrics:")
+    print(combined.to_string(index=False))
 
-    # ── 4. Evaluation ─────────────────────────────────────────────────────────
-    banner("STEP 4 — Evaluation on Held-Out Test Set")
-    from src.evaluation import evaluate_model
-    metrics = evaluate_model(model, branch_idxs, data, cfg, le, tag="test")
-
-    # Save scalar metrics summary
-    import json, pathlib
-    pathlib.Path(cfg["paths"]["metrics_dir"]).mkdir(parents=True, exist_ok=True)
-    summary_path = os.path.join(cfg["paths"]["metrics_dir"], "test_metrics_summary.json")
-    with open(summary_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"[Run] Metrics summary → {summary_path}")
-
-    # ── 5. Baselines ──────────────────────────────────────────────────────────
+    # ── 4. Baselines ──────────────────────────────────────────────────────────
     if not args.skip_baselines:
-        banner("STEP 5 — Baseline Model Comparison")
-        from src.baselines import run_baselines
-        baseline_df = run_baselines(data, cfg)
-        # Append main model result for fair comparison
-        import pandas as pd
+        print("\n" + "="*60)
+        print("  STEP 4: Baselines")
+        print("="*60)
+        bl_df = run_baselines(data, cfg)
         main_row = pd.DataFrame([{
-            "model":        "CNN-BiLSTM (ours)",
-            "accuracy":     metrics["accuracy"],
-            "f1_macro":     metrics["f1"],
-            "train_time_s": round(time.time() - t0, 1),
+            "model": "CNN-BiLSTM (ours)",
+            "accuracy":    round(test_metrics["accuracy"], 4),
+            "f1_macro":    round(test_metrics["f1"], 4),
+            "train_time_s": "—",
         }])
-        full_df = pd.concat([baseline_df, main_row], ignore_index=True)
-        full_df.to_csv(
-            os.path.join(cfg["paths"]["metrics_dir"], "full_comparison.csv"),
+        full_table = pd.concat([bl_df, main_row], ignore_index=True)
+        full_table.to_csv(
+            os.path.join(cfg["paths"]["metrics_dir"], "all_models_comparison.csv"),
             index=False)
-        print("\n[Run] Full model comparison:")
-        print(full_df.to_string(index=False))
-    else:
-        print("[Run] Skipping baselines (--skip-baselines).")
+        print("\n[Baselines] Full comparison:")
+        print(full_table.to_string(index=False))
 
-    # ── 6. Robustness ─────────────────────────────────────────────────────────
+    # ── 5. Robustness ─────────────────────────────────────────────────────────
     if not args.skip_robustness:
-        banner("STEP 6 — Robustness Testing")
-        from src.robustness import noise_robustness, window_ablation
+        print("\n" + "="*60)
+        print("  STEP 5: Robustness")
+        print("="*60)
         noise_robustness(model, branch_idxs, data, cfg)
-        window_ablation(model, branch_idxs, data, cfg)
-    else:
-        print("[Run] Skipping robustness (--skip-robustness).")
+        window_ablation(model,  branch_idxs, data, cfg)
 
-    # ── 7. Explainability ─────────────────────────────────────────────────────
-    if not args.skip_explain:
-        banner("STEP 7 — Explainability")
-        from src.explainability import permutation_importance, compute_saliency
-        perm_df = permutation_importance(
+    # ── 6. Explainability ─────────────────────────────────────────────────────
+    if not args.skip_explainability:
+        print("\n" + "="*60)
+        print("  STEP 6: Explainability")
+        print("="*60)
+        permutation_importance(
             model, branch_idxs,
             data["X_test"], data["y_test"],
-            cfg["data"]["features"], cfg, n_repeats=3
-        )
-        # Saliency on first test sample
-        compute_saliency(model, data["X_test"][0], branch_idxs,
-                         int(data["y_test"][0]), cfg)
-    else:
-        print("[Run] Skipping explainability (--skip-explain).")
+            cfg["data"]["features"], cfg)
 
-    # ── 8. Save run config ────────────────────────────────────────────────────
-    save_config(cfg, cfg["paths"]["config_path"])
 
-    banner(f"PIPELINE COMPLETE — Total time: {(time.time()-t_total)/60:.1f} min")
-    print(f"  Model   → {cfg['paths']['model_path']}")
-    print(f"  Metrics → {cfg['paths']['metrics_dir']}/")
-    print(f"  Plots   → {cfg['paths']['plots_dir']}/\n")
+        for cls_idx in range(cfg["model"]["num_classes"]):
+            mask = (data["y_test"] == cls_idx)
+            if not mask.any():
+                continue
+            sample = data["X_test"][np.where(mask)[0][0]]
+            compute_saliency(model, sample, branch_idxs, cls_idx, cfg)
+            break
+
+    print("\n" + "="*60)
+    print("  PIPELINE COMPLETE")
+    print("  Outputs in: outputs/")
+    print("="*60 + "\n")
 
 
 if __name__ == "__main__":

@@ -2,111 +2,110 @@
 Baseline model comparison: SVM, Random Forest, Extra-Trees, Simple CNN, Simple LSTM.
 Results saved as CSV + bar chart.
 """
-import os
-import time
+"""Baseline comparison: SVM, RF, ExtraTrees, SimpleCNN, SimpleLSTM."""
+import os, time
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.metrics import accuracy_score, f1_score
-from tensorflow import keras
-from src.model import build_simple_cnn, build_simple_lstm
-from src.training import _prepare_inputs
+
+from src.model     import build_simple_cnn, build_simple_lstm
+from src.training  import get_device, make_loader, _run_epoch, EarlyStopping
+from src.evaluation import _predict_probs
 
 
-def _train_predict_sklearn(clf, X_tr, y_tr, X_te, y_te, name: str):
+def _sk_eval(clf, Xtr, ytr, Xte, yte, name):
     t0 = time.time()
-    clf.fit(X_tr, y_tr)
+    clf.fit(Xtr, ytr)
     elapsed = time.time() - t0
-    y_pred = clf.predict(X_te)
-    acc = accuracy_score(y_te, y_pred)
-    f1  = f1_score(y_te, y_pred, average="macro", zero_division=0)
-    print(f"  {name:<25} acc={acc:.4f}  f1={f1:.4f}  ({elapsed:.1f}s)")
-    return {"model": name, "accuracy": acc, "f1_macro": f1, "train_time_s": round(elapsed, 1)}
+    yp  = clf.predict(Xte)
+    acc = accuracy_score(yte, yp)
+    f1  = f1_score(yte, yp, average="macro", zero_division=0)
+    print("  {:<28} acc={:.4f}  f1={:.4f}  ({:.1f}s)".format(name, acc, f1, elapsed))
+    return {"model": name, "accuracy": round(acc,4),
+            "f1_macro": round(f1,4), "train_time_s": round(elapsed,1)}
 
 
-def _train_predict_dl(model_fn, cfg, data, name: str):
-    model, bidxs = model_fn(cfg)
-    tc = cfg["training"]
-    nc = cfg["model"]["num_classes"]
-    X_tr = _prepare_inputs(data["X_train"], bidxs)
-    X_te = _prepare_inputs(data["X_test"],  bidxs)
-    y_tr = keras.utils.to_categorical(data["y_train"], nc)
-    y_te_cat = keras.utils.to_categorical(data["y_test"],  nc)
-
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
-    cb = [keras.callbacks.EarlyStopping(monitor="val_loss", patience=6,
-                                         restore_best_weights=True, verbose=0)]
-    t0 = time.time()
-    model.fit(X_tr, y_tr, validation_split=0.15, epochs=40,
-              batch_size=tc["batch_size"], callbacks=cb, verbose=0)
+def _dl_eval(build_fn, cfg, data, name):
+    device  = get_device()
+    model, bi = build_fn(cfg)
+    model   = model.to(device)
+    tc      = cfg["training"]
+    crit    = nn.CrossEntropyLoss()
+    opt     = torch.optim.Adam(model.parameters(), lr=tc["learning_rate"])
+    tr_ld   = make_loader(data["X_train"], data["y_train"],
+                          bi, tc["batch_size"], True,  device)
+    vl_ld   = make_loader(data["X_val"],   data["y_val"],
+                          bi, tc["batch_size"], False, device)
+    es      = EarlyStopping(patience=6)
+    t0      = time.time()
+    for _ in range(40):
+        _run_epoch(model, tr_ld, crit, opt,  device, bi, True)
+        vl, _ = _run_epoch(model, vl_ld, crit, None, device, bi, False)
+        if es.step(vl, model):
+            break
+    es.restore(model)
     elapsed = time.time() - t0
-
-    y_prob = model.predict(X_te, batch_size=256, verbose=0)
-    y_pred = np.argmax(y_prob, axis=1)
-    acc = accuracy_score(data["y_test"], y_pred)
-    f1  = f1_score(data["y_test"], y_pred, average="macro", zero_division=0)
-    print(f"  {name:<25} acc={acc:.4f}  f1={f1:.4f}  ({elapsed:.1f}s)")
-    keras.backend.clear_session()
-    return {"model": name, "accuracy": acc, "f1_macro": f1, "train_time_s": round(elapsed, 1)}
+    yp  = np.argmax(_predict_probs(model, data["X_test"], bi, device), axis=1)
+    acc = accuracy_score(data["y_test"], yp)
+    f1  = f1_score(data["y_test"], yp, average="macro", zero_division=0)
+    print("  {:<28} acc={:.4f}  f1={:.4f}  ({:.1f}s)".format(name, acc, f1, elapsed))
+    return {"model": name, "accuracy": round(acc,4),
+            "f1_macro": round(f1,4), "train_time_s": round(elapsed,1)}
 
 
 def run_baselines(data: dict, cfg: dict) -> pd.DataFrame:
     pp = cfg["paths"]
-    os.makedirs(pp["metrics_dir"], exist_ok=True)
-    os.makedirs(pp["plots_dir"],   exist_ok=True)
+    Path(pp["metrics_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(pp["plots_dir"]).mkdir(parents=True, exist_ok=True)
 
-    X_tr_f = data["X_train_flat"]
-    X_te_f = data["X_test_flat"]
-    y_tr   = data["y_train"]
-    y_te   = data["y_test"]
+    Xtr, ytr = data["X_train_flat"], data["y_train"]
+    Xte, yte = data["X_test_flat"],  data["y_test"]
 
-    print("\n[Baselines] Training comparison models …")
-    results = []
-
-    results.append(_train_predict_sklearn(
-        SVC(kernel="rbf", C=10, gamma="scale", decision_function_shape="ovr",
-            class_weight="balanced", random_state=42),
-        X_tr_f, y_tr, X_te_f, y_te, "SVM (RBF)"))
-
-    results.append(_train_predict_sklearn(
-        RandomForestClassifier(n_estimators=200, class_weight="balanced",
-                               n_jobs=-1, random_state=42),
-        X_tr_f, y_tr, X_te_f, y_te, "Random Forest"))
-
-    results.append(_train_predict_sklearn(
-        ExtraTreesClassifier(n_estimators=200, class_weight="balanced",
-                             n_jobs=-1, random_state=42),
-        X_tr_f, y_tr, X_te_f, y_te, "Extra-Trees"))
-
-    results.append(_train_predict_dl(build_simple_cnn,  cfg, data, "Simple CNN"))
-    results.append(_train_predict_dl(build_simple_lstm, cfg, data, "Simple LSTM"))
-
+    print("\n[Baselines] Running comparison...")
+    results = [
+        _sk_eval(SVC(kernel="rbf", C=10, gamma="scale",
+                     class_weight="balanced", random_state=42),
+                 Xtr, ytr, Xte, yte, "SVM (RBF)"),
+        _sk_eval(RandomForestClassifier(n_estimators=200,
+                     class_weight="balanced", n_jobs=-1, random_state=42),
+                 Xtr, ytr, Xte, yte, "Random Forest"),
+        _sk_eval(ExtraTreesClassifier(n_estimators=200,
+                     class_weight="balanced", n_jobs=-1, random_state=42),
+                 Xtr, ytr, Xte, yte, "Extra-Trees"),
+        _dl_eval(build_simple_cnn,  cfg, data, "Simple CNN  (PyTorch)"),
+        _dl_eval(build_simple_lstm, cfg, data, "Simple LSTM (PyTorch)"),
+    ]
     df = pd.DataFrame(results)
-    csv_path = os.path.join(pp["metrics_dir"], "baseline_comparison.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"\n[Baselines] Results saved → {csv_path}")
+    df.to_csv(os.path.join(pp["metrics_dir"], "baseline_comparison.csv"), index=False)
+    print("[Baselines] Saved.")
 
-    # Bar chart
+    colors = ["#0077b6","#2d9057","#e63946","#f4a261","#8338ec"]
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Baseline Model Comparison", fontsize=14, fontweight="bold")
-    colors = ["#0077b6", "#2d9057", "#e63946", "#f4a261", "#8338ec"]
-    for ax, metric in zip(axes, ["accuracy", "f1_macro"]):
-        bars = ax.bar(df["model"], df[metric], color=colors, edgecolor="white", width=0.6)
+    fig.suptitle("Baseline Model Comparison", fontsize=13, fontweight="bold")
+    for ax, metric in zip(axes, ["accuracy","f1_macro"]):
+        bars = ax.bar(df["model"], df[metric], color=colors,
+                      edgecolor="white", width=0.55)
         for b in bars:
-            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.005,
-                    f"{b.get_height():.3f}", ha="center", va="bottom", fontsize=9)
-        ax.set_ylim(0, 1.05)
-        ax.set_title(metric.replace("_", " ").title())
-        ax.set_ylabel(metric)
-        ax.tick_params(axis="x", rotation=20)
+            ax.text(b.get_x()+b.get_width()/2, b.get_height()+0.005,
+                    "{:.3f}".format(b.get_height()),
+                    ha="center", va="bottom", fontsize=9)
+        ax.set_ylim(0, 1.1)
+        ax.set_title(metric.replace("_"," ").title())
+        ax.tick_params(axis="x", rotation=18)
         ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
-    chart_path = os.path.join(pp["plots_dir"], "baseline_comparison.png")
-    plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+    plt.savefig(os.path.join(pp["plots_dir"], "baseline_comparison.png"),
+                dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[Baselines] Chart → {chart_path}")
     return df

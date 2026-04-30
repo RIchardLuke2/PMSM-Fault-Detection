@@ -1,0 +1,74 @@
+data:
+  features:
+  - Ia
+  - Ib
+  - VDC
+  - IDC
+  - T1
+  - T2
+  - T3
+  - VD
+  raw_path: data/converted_dataset.csv
+  target: FDD
+  test_size: 0.15
+  val_size: 0.15
+model:
+  attention: true
+  branches:
+    current_branch:
+    - Ia
+    - Ib
+    dc_branch:
+    - IDC
+    thermal_branch:
+    - T1
+    - T2
+    - T3
+    voltage_branch:
+    - VDC
+    - VD
+  dropout: 0.4
+  filters:
+  - 64
+  - 128
+  - 64
+  l2_reg: 0.0001
+  lstm_units: 128
+  num_classes: 9
+  residual: true
+paths:
+  config_save: outputs/models/config_saved.yaml
+  encoder_path: outputs/models/encoder.pkl
+  metrics_dir: outputs/metrics
+  model_path: outputs/models/pmsm_cnn_bilstm.pt
+  plots_dir: outputs/plots
+  scaler_path: outputs/models/scaler.pkl
+robustness:
+  noise_levels:
+  - 0.0
+  - 0.01
+  - 0.05
+  - 0.1
+  - 0.2
+  - 0.5
+  strides:
+  - 1
+  - 5
+  - 10
+  window_sizes:
+  - 5
+  - 10
+  - 20
+  - 30
+seed: 42
+training:
+  batch_size: 256
+  class_weights: true
+  early_stopping_patience: 12
+  epochs: 100
+  learning_rate: 0.001
+  reduce_lr_factor: 0.5
+  reduce_lr_patience: 5
+windowing:
+  stride: 5
+  window_size: 10

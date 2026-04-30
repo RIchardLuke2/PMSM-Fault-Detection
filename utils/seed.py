@@ -1,12 +1,14 @@
 """Global reproducibility: seed every random source."""
-import os, random, numpy as np
+import os, random
+import numpy as np
+import torch
 
-def set_global_seed(seed: int = 42):
-    os.environ["PYTHONHASHSEED"] = str(seed)
+def set_all_seeds(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        import tensorflow as tf
-        tf.random.set_seed(seed)
-    except ImportError:
-        pass
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[Seed] All seeds set to {seed}")

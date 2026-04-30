@@ -1,172 +1,295 @@
 """
-Leak-free preprocessing pipeline for PMSM FDD.
+Leak-free preprocessing pipeline.
 
-Key design decisions
---------------------
-1. Train/val/test split happens BEFORE any fitting (scaler, encoder).
-2. Sliding windows are created AFTER the split so no window straddles
-   the boundary, eliminating temporal leakage.
-3. Scaler and LabelEncoder are fit on training data only, then applied
-   to val/test.
+Order:
+  1. Split raw rows: train / val / test  (NO windowing yet)
+  2. Fit scaler on X_train ONLY
+  3. Scale val + test
+  4. Apply sliding window per split
+
+Main fix:
+  - window labels use the CENTER sample by default instead of majority vote
+  - raw and windowed class distributions are printed so imbalance is visible
+  - one shared split helper keeps scaler fitting and pipeline data aligned
 """
+
+import os
+from pathlib import Path
+from typing import Tuple, Dict
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, LabelEncoder
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
-from utils.io_utils import save_artifact, load_config
 
 
-_SCALERS = {"standard": StandardScaler, "minmax": MinMaxScaler, "robust": RobustScaler}
+# ----------------------------
+# Small utilities
+# ----------------------------
+
+def _get_paths(cfg: dict) -> Tuple[str, str]:
+    pp = cfg.get("paths", {})
+    plots_dir = pp.get("plots_dir", "outputs/plots")
+    metrics_dir = pp.get("metrics_dir", "outputs/metrics")
+    Path(plots_dir).mkdir(parents=True, exist_ok=True)
+    Path(metrics_dir).mkdir(parents=True, exist_ok=True)
+    return plots_dir, metrics_dir
 
 
-# ── Outlier removal ──────────────────────────────────────────────────────────
+def show_class_distribution_df(df: pd.DataFrame, target_col: str, title: str = "Class distribution") -> None:
+    counts = df[target_col].value_counts().sort_index()
+    perc = df[target_col].value_counts(normalize=True).sort_index() * 100
 
-def remove_outliers(df: pd.DataFrame, features: list, method: str = "iqr",
-                    threshold: float = 3.0) -> pd.DataFrame:
-    """Replace outliers with NaN; they are later imputed by forward-fill."""
-    df = df.copy()
-    if method == "iqr":
-        for col in features:
-            Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lo, hi = Q1 - threshold * IQR, Q3 + threshold * IQR
-            mask = (df[col] < lo) | (df[col] > hi)
-            df.loc[mask, col] = np.nan
-    elif method == "zscore":
-        for col in features:
-            z = (df[col] - df[col].mean()) / (df[col].std() + 1e-9)
-            df.loc[z.abs() > threshold, col] = np.nan
+    print("\n" + "=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
+    for cls in counts.index:
+        print(f"{cls}: {counts[cls]} samples ({perc[cls]:.2f}%)")
+    print("=" * 60 + "\n")
+
+
+def show_encoded_distribution(y: np.ndarray, encoder: LabelEncoder, title: str = "Window distribution") -> None:
+    if len(y) == 0:
+        print(f"[Preprocess] {title}: empty")
+        return
+
+    unique, counts = np.unique(y, return_counts=True)
+    names = encoder.inverse_transform(unique)
+
+    print("\n" + "=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
+    for name, c in zip(names, counts):
+        print(f"{name}: {int(c)} samples")
+    print("=" * 60 + "\n")
+
+
+def plot_class_distribution_df(df: pd.DataFrame, target_col: str, out_path: str, title: str = "Class distribution") -> None:
+    counts = df[target_col].value_counts().sort_index()
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    counts.plot(kind="bar", ax=ax)
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Number of samples")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+# ----------------------------
+# Load / clean
+# ----------------------------
+
+def load_and_clean(cfg: dict) -> pd.DataFrame:
+    raw = cfg["data"]["raw_path"]
+    feat = cfg["data"]["features"]
+    tgt = cfg["data"]["target"]
+    plots_dir, _ = _get_paths(cfg)
+
+    if not os.path.exists(raw):
+        print("[Preprocess] CSV not found — generating synthetic data...")
+        from utils.data_gen import generate
+        df = generate(n_per_class=1000, seed=cfg.get("seed", 42))
+        Path(raw).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(raw, index=False)
+    else:
+        df = pd.read_csv(raw)
+
+    missing = [c for c in feat + [tgt] if c not in df.columns]
+    if missing:
+        raise ValueError("Missing columns: " + str(missing))
+
+    n_nan = int(df[feat].isnull().sum().sum())
+    if n_nan:
+        print(f"[Preprocess] Filling {n_nan} NaN with median")
+        df[feat] = df[feat].fillna(df[feat].median())
+
+    for col in feat:
+        p1 = df[col].quantile(0.01)
+        p99 = df[col].quantile(0.99)
+        iqr = p99 - p1
+        df[col] = df[col].clip(p1 - 3 * iqr, p99 + 3 * iqr)
+
+    print(f"[Preprocess] {len(df)} rows, {df[tgt].nunique()} classes")
+    show_class_distribution_df(df, tgt, title="Raw class distribution")
+    plot_class_distribution_df(
+        df,
+        tgt,
+        os.path.join(plots_dir, "class_distribution_raw.png"),
+        title="Raw class distribution",
+    )
     return df
 
 
-def impute(df: pd.DataFrame, features: list) -> pd.DataFrame:
-    """Forward-fill then backward-fill; remaining NaNs → column median."""
-    df = df.copy()
-    df[features] = df[features].ffill().bfill()
-    for col in features:
-        if df[col].isna().any():
-            df[col].fillna(df[col].median(), inplace=True)
-    return df
+# ----------------------------
+# Labels
+# ----------------------------
+
+def encode_labels(df: pd.DataFrame, cfg: dict) -> LabelEncoder:
+    enc = LabelEncoder()
+    enc.fit(sorted(df[cfg["data"]["target"]].unique()))
+    print("[Preprocess] Classes:", list(enc.classes_))
+    return enc
 
 
-# ── Splitting ─────────────────────────────────────────────────────────────────
+# ----------------------------
+# Shared split helper
+# ----------------------------
 
-def split_by_class(df: pd.DataFrame, target: str, test_size: float,
-                   val_size: float, seed: int):
+def _split_train_val_test(X: np.ndarray, y: np.ndarray, cfg: dict):
+    seed = cfg.get("seed", 42)
+    ts = cfg["data"]["test_size"]
+    vs = cfg["data"]["val_size"]
+
+    # First split off test
+    X_tmp, X_test, y_tmp, y_test = train_test_split(
+        X, y,
+        test_size=ts,
+        random_state=seed,
+        stratify=y
+    )
+
+    # Then split tmp into train and val
+    val_frac = vs / (1.0 - ts)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tmp, y_tmp,
+        test_size=val_frac,
+        random_state=seed,
+        stratify=y_tmp
+    )
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+# ----------------------------
+# Scaler
+# ----------------------------
+
+def fit_scaler(df: pd.DataFrame, cfg: dict) -> StandardScaler:
+    feat = cfg["data"]["features"]
+    tgt = cfg["data"]["target"]
+
+    X = df[feat].values
+    y = df[tgt].values
+
+    Xtr, _, _, _, _, _ = _split_train_val_test(X, y, cfg)
+
+    sc = StandardScaler()
+    sc.fit(Xtr)
+    print(f"[Preprocess] Scaler fitted on {len(Xtr)} rows")
+    return sc
+
+
+# ----------------------------
+# Windowing
+# ----------------------------
+
+def _window_label(y_window: np.ndarray, label_strategy: str = "center") -> int:
     """
-    Stratified split that preserves class balance across all three sets.
-    Split order: full → trainval + test → train + val.
+    Choose the label for one window.
+
+    Strategies:
+      - center: label at the center timestep (default, best starting point)
+      - last:   label at the last timestep
+      - majority: majority vote across the window
     """
-    trainval, test = train_test_split(df, test_size=test_size,
-                                      stratify=df[target], random_state=seed)
-    relative_val = val_size / (1 - test_size)
-    train, val = train_test_split(trainval, test_size=relative_val,
-                                  stratify=trainval[target], random_state=seed)
-    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+    label_strategy = (label_strategy or "center").lower()
+
+    if len(y_window) == 0:
+        raise ValueError("Empty window received in _window_label")
+
+    if label_strategy == "center":
+        return int(y_window[len(y_window) // 2])
+    if label_strategy == "last":
+        return int(y_window[-1])
+    if label_strategy == "majority":
+        y_int = y_window.astype(int)
+        return int(np.bincount(y_int).argmax())
+
+    raise ValueError(f"Unknown label_strategy: {label_strategy}")
 
 
-# ── Windowing ─────────────────────────────────────────────────────────────────
+def make_windows(
+    X: np.ndarray,
+    y: np.ndarray,
+    window_size: int,
+    stride: int,
+    label_strategy: str = "center",
+):
+    if len(X) < window_size:
+        return (
+            np.empty((0, window_size, X.shape[1]), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
 
-def make_windows(X: np.ndarray, y: np.ndarray, window_size: int,
-                 stride: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Create sliding windows.  A window's label is the MAJORITY class
-    within that window (handles boundary ambiguity cleanly).
+    wins, labs = [], []
+    for s in range(0, len(X) - window_size + 1, stride):
+        xw = X[s:s + window_size]
+        yw = y[s:s + window_size]
+        wins.append(xw)
+        labs.append(_window_label(yw, label_strategy=label_strategy))
 
-    Returns
-    -------
-    X_win : (N, window_size, n_features)
-    y_win : (N,)  integer labels
-    """
-    n_samples, n_features = X.shape
-    starts = range(0, n_samples - window_size + 1, stride)
-    X_win, y_win = [], []
-    for s in starts:
-        e = s + window_size
-        X_win.append(X[s:e])
-        # majority-vote label inside window
-        labels, counts = np.unique(y[s:e], return_counts=True)
-        y_win.append(labels[counts.argmax()])
-    return np.array(X_win, dtype=np.float32), np.array(y_win, dtype=np.int32)
+    return np.array(wins, dtype=np.float32), np.array(labs, dtype=np.int64)
 
 
-def flatten_windows(X_win: np.ndarray) -> np.ndarray:
-    """Flatten (N, W, F) → (N, W*F) for sklearn baseline models."""
-    return X_win.reshape(X_win.shape[0], -1)
+# ----------------------------
+# Main pipeline
+# ----------------------------
 
+def build_pipeline_data(df, encoder, scaler, cfg) -> dict:
+    feat = cfg["data"]["features"]
+    tgt = cfg["data"]["target"]
+    ws = cfg["windowing"]["window_size"]
+    st = cfg["windowing"]["stride"]
+    label_strategy = cfg.get("windowing", {}).get("label_strategy", "center")
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+    X = df[feat].values.astype(np.float64)
+    y = encoder.transform(df[tgt].values).astype(np.int64)
 
-def run_preprocessing(cfg: dict) -> dict:
-    dc = cfg["data"]
-    pc = cfg["preprocessing"]
-    wc = cfg["windowing"]
+    Xtr, Xv, Xte, ytr, yv, yte = _split_train_val_test(X, y, cfg)
 
-    # 1. Load raw data
-    df = pd.read_csv(dc["raw_path"])
-    print(f"[Preprocess] Loaded {len(df):,} rows, {df.shape[1]} cols")
-    print(f"[Preprocess] Missing before clean: {df[dc['features']].isna().sum().sum()}")
+    # Show class balance before windowing
+    show_encoded_distribution(ytr, encoder, title="Train split before windowing")
+    show_encoded_distribution(yv, encoder, title="Validation split before windowing")
+    show_encoded_distribution(yte, encoder, title="Test split before windowing")
 
-    # 2. Outlier → NaN
-    df = remove_outliers(df, dc["features"], method=pc["outlier_method"],
-                          threshold=pc["outlier_threshold"])
+    # Scale using train-only scaler
+    Xtr_s = scaler.transform(Xtr).astype(np.float32)
+    Xv_s = scaler.transform(Xv).astype(np.float32)
+    Xte_s = scaler.transform(Xte).astype(np.float32)
 
-    # 3. Impute
-    df = impute(df, dc["features"])
-    print(f"[Preprocess] Missing after impute: {df[dc['features']].isna().sum().sum()}")
+    # Window each split
+    Xtrw, ytrw = make_windows(Xtr_s, ytr, ws, st, label_strategy=label_strategy)
+    Xvw, yvw = make_windows(Xv_s, yv, ws, st, label_strategy=label_strategy)
+    Xtew, ytew = make_windows(Xte_s, yte, ws, st, label_strategy=label_strategy)
 
-    # 4. Label encode (fit only after we have the full label set)
-    le = LabelEncoder()
-    df["label"] = le.fit_transform(df[dc["target"]])
-    print(f"[Preprocess] Classes: {list(le.classes_)}")
+    print(f"[Preprocess] train={Xtrw.shape}  val={Xvw.shape}  test={Xtew.shape}")
 
-    # 5. Stratified split (raw rows, BEFORE windowing)
-    train_df, val_df, test_df = split_by_class(
-        df, "label", dc["test_size"], dc["val_size"], dc["random_seed"])
-    print(f"[Preprocess] Split → train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
+    # Show class balance after windowing
+    show_encoded_distribution(ytrw, encoder, title=f"Train windows ({label_strategy})")
+    show_encoded_distribution(yvw, encoder, title=f"Validation windows ({label_strategy})")
+    show_encoded_distribution(ytew, encoder, title=f"Test windows ({label_strategy})")
 
-    # 6. Fit scaler on TRAIN only
-    scaler_cls = _SCALERS[pc["scaler"]]
-    scaler = scaler_cls()
-    X_train_raw = scaler.fit_transform(train_df[dc["features"]].values)
-    X_val_raw   = scaler.transform(val_df[dc["features"]].values)
-    X_test_raw  = scaler.transform(test_df[dc["features"]].values)
+    # Optional warning if a split ends up empty
+    if len(Xtrw) == 0 or len(Xvw) == 0 or len(Xtew) == 0:
+        raise ValueError(
+            f"One of the splits became empty after windowing. "
+            f"Check window_size={ws}, stride={st}, and label_strategy={label_strategy}."
+        )
 
-    y_train_raw = train_df["label"].values
-    y_val_raw   = val_df["label"].values
-    y_test_raw  = test_df["label"].values
-
-    # 7. Sliding windows (per-split, no leakage across split boundaries)
-    ws, st = wc["window_size"], wc["stride"]
-    X_train, y_train = make_windows(X_train_raw, y_train_raw, ws, st)
-    X_val,   y_val   = make_windows(X_val_raw,   y_val_raw,   ws, st)
-    X_test,  y_test  = make_windows(X_test_raw,  y_test_raw,  ws, st)
-
-    print(f"[Preprocess] Window shapes  → train={X_train.shape}  val={X_val.shape}  test={X_test.shape}")
-
-    # 8. Save artefacts
-    out = cfg["paths"]
-    save_artifact(scaler, out["scaler_path"])
-    save_artifact(le,     out["encoder_path"])
-
-    processed = {
-        "X_train": X_train, "y_train": y_train,
-        "X_val":   X_val,   "y_val":   y_val,
-        "X_test":  X_test,  "y_test":  y_test,
-        "scaler":  scaler,  "encoder": le,
-        "features": dc["features"],
+    return {
+        "X_train": Xtrw, "y_train": ytrw,
+        "X_val": Xvw, "y_val": yvw,
+        "X_test": Xtew, "y_test": ytew,
+        "X_train_flat": Xtrw.reshape(len(Xtrw), -1),
+        "X_val_flat": Xvw.reshape(len(Xvw), -1),
+        "X_test_flat": Xtew.reshape(len(Xtew), -1),
+        "X_test_raw_scaled": Xte_s,
+        "y_test_raw": yte,
     }
-
-    # Also save flattened versions for baseline models
-    if wc.get("flatten_for_ml", True):
-        processed["X_train_flat"] = flatten_windows(X_train)
-        processed["X_val_flat"]   = flatten_windows(X_val)
-        processed["X_test_flat"]  = flatten_windows(X_test)
-
-    return processed
-
-
-if __name__ == "__main__":
-    cfg = load_config()
-    run_preprocessing(cfg)

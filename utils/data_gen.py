@@ -16,57 +16,47 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+"""Synthetic PMSM dataset — used when no real CSV is present."""
+import numpy as np
+import pandas as pd
 
-FAULT_PROFILES = {
-    "F0": dict(Ia_amp=1.0, Ib_amp=1.0, phase_offset=0,   VDC_base=560, IDC_base=10, T_base=[40,40,40], VD_base=0.7,  noise=0.02),
-    "F1": dict(Ia_amp=0.5, Ib_amp=1.1, phase_offset=0.1,  VDC_base=555, IDC_base=10.5, T_base=[45,40,40], VD_base=0.75, noise=0.04),
-    "F2": dict(Ia_amp=1.1, Ib_amp=0.5, phase_offset=-0.1, VDC_base=555, IDC_base=10.5, T_base=[40,45,40], VD_base=0.75, noise=0.04),
-    "F3": dict(Ia_amp=0.6, Ib_amp=1.0, phase_offset=0.2,  VDC_base=550, IDC_base=11,   T_base=[40,40,45], VD_base=0.78, noise=0.05),
-    "F4": dict(Ia_amp=1.0, Ib_amp=0.6, phase_offset=-0.2, VDC_base=550, IDC_base=11,   T_base=[46,40,40], VD_base=0.78, noise=0.05),
-    "F5": dict(Ia_amp=0.4, Ib_amp=1.2, phase_offset=0.3,  VDC_base=545, IDC_base=11.5, T_base=[40,46,40], VD_base=0.80, noise=0.06),
-    "F6": dict(Ia_amp=1.2, Ib_amp=0.4, phase_offset=-0.3, VDC_base=545, IDC_base=11.5, T_base=[40,40,46], VD_base=0.80, noise=0.06),
-    "F7": dict(Ia_amp=0.3, Ib_amp=0.3, phase_offset=0.5,  VDC_base=535, IDC_base=13,   T_base=[50,48,44], VD_base=0.85, noise=0.08),
-    "F8": dict(Ia_amp=2.0, Ib_amp=2.0, phase_offset=0.0,  VDC_base=520, IDC_base=18,   T_base=[60,60,58], VD_base=1.10, noise=0.10),
+FEATURES = ["Ia", "Ib", "VDC", "IDC", "T1", "T2", "T3", "VD"]
+
+_PARAMS = {
+    "F0": {"Ia":(1.00,0.05),"Ib":(1.00,0.05),"VDC":(560,5), "IDC":(10.0,0.5),
+           "T1":(40,1),"T2":(40,1),"T3":(40,1),"VD":(0.70,0.02)},
+    "F1": {"Ia":(0.50,0.10),"Ib":(1.00,0.05),"VDC":(555,8), "IDC":(9.5,0.5),
+           "T1":(42,2),"T2":(41,1),"T3":(40,1),"VD":(0.68,0.03)},
+    "F2": {"Ia":(1.00,0.05),"Ib":(0.50,0.10),"VDC":(555,8), "IDC":(9.5,0.5),
+           "T1":(40,1),"T2":(42,2),"T3":(41,1),"VD":(0.68,0.03)},
+    "F3": {"Ia":(0.60,0.10),"Ib":(0.90,0.05),"VDC":(552,10),"IDC":(9.2,0.6),
+           "T1":(43,2),"T2":(41,1),"T3":(40,1),"VD":(0.66,0.03)},
+    "F4": {"Ia":(0.90,0.05),"Ib":(0.60,0.10),"VDC":(552,10),"IDC":(9.2,0.6),
+           "T1":(40,1),"T2":(43,2),"T3":(41,1),"VD":(0.66,0.03)},
+    "F5": {"Ia":(0.55,0.10),"Ib":(0.95,0.05),"VDC":(550,12),"IDC":(9.0,0.7),
+           "T1":(44,2),"T2":(41,1),"T3":(42,2),"VD":(0.65,0.04)},
+    "F6": {"Ia":(0.95,0.05),"Ib":(0.55,0.10),"VDC":(550,12),"IDC":(9.0,0.7),
+           "T1":(40,1),"T2":(44,2),"T3":(42,2),"VD":(0.65,0.04)},
+    "F7": {"Ia":(0.40,0.15),"Ib":(0.40,0.15),"VDC":(545,15),"IDC":(8.5,0.8),
+           "T1":(46,3),"T2":(45,3),"T3":(44,2),"VD":(0.62,0.05)},
+    "F8": {"Ia":(1.80,0.20),"Ib":(1.80,0.20),"VDC":(520,20),"IDC":(14.0,1.5),
+           "T1":(55,5),"T2":(54,4),"T3":(53,4),"VD":(0.58,0.06)},
 }
 
-N_SAMPLES_PER_CLASS = 3000
-FS = 10000  # Hz
-T_PERIOD = 0.02  # 50 Hz fundamental
-
-
-def _gen_class(fault_id: str, n: int, rng: np.random.Generator) -> pd.DataFrame:
-    p = FAULT_PROFILES[fault_id]
-    t = np.linspace(0, n * T_PERIOD / FS, n)
-    omega = 2 * np.pi * 50
-
-    Ia  = p["Ia_amp"] * np.sin(omega * t + p["phase_offset"]) + rng.normal(0, p["noise"], n)
-    Ib  = p["Ib_amp"] * np.sin(omega * t + p["phase_offset"] + 2 * np.pi / 3) + rng.normal(0, p["noise"], n)
-    VDC = p["VDC_base"] + 5 * np.sin(0.1 * omega * t) + rng.normal(0, 2, n)
-    IDC = p["IDC_base"] + 0.5 * np.abs(np.sin(omega * t)) + rng.normal(0, 0.2, n)
-    T1  = p["T_base"][0] + 3 * np.sin(0.05 * omega * t) + rng.normal(0, 0.5, n)
-    T2  = p["T_base"][1] + 2 * np.sin(0.05 * omega * t + 1) + rng.normal(0, 0.5, n)
-    T3  = p["T_base"][2] + 2.5 * np.sin(0.05 * omega * t + 2) + rng.normal(0, 0.5, n)
-    VD  = p["VD_base"] + 0.05 * np.sin(omega * t) + rng.normal(0, 0.01, n)
-
-    # Inject ~2% NaN for missing-data simulation
-    for arr in [Ia, Ib, VDC, IDC, T1, T2, T3, VD]:
-        idx = rng.choice(n, size=int(0.02 * n), replace=False)
-        arr[idx] = np.nan
-
-    return pd.DataFrame({"Ia": Ia, "Ib": Ib, "VDC": VDC, "IDC": IDC,
-                          "T1": T1, "T2": T2, "T3": T3, "VD": VD, "FDD": fault_id})
-
-
-def generate_dataset(out_path: str = "data/pmsm_data.csv", seed: int = 42):
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+def generate(n_per_class: int = 1000, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    dfs = [_gen_class(fid, N_SAMPLES_PER_CLASS, rng) for fid in FAULT_PROFILES]
-    df  = pd.concat(dfs, ignore_index=True).sample(frac=1, random_state=seed)
-    df.to_csv(out_path, index=False)
-    print(f"[DataGen] Saved {len(df):,} rows → {out_path}")
-    print(df["FDD"].value_counts().to_string())
+    rows = []
+    for label, params in _PARAMS.items():
+        for _ in range(n_per_class):
+            row = {f: float(rng.normal(params[f][0], params[f][1])) for f in FEATURES}
+            row["FDD"] = label
+            rows.append(row)
+    df = pd.DataFrame(rows).sample(frac=1, random_state=seed).reset_index(drop=True)
     return df
 
-
 if __name__ == "__main__":
-    generate_dataset()
+    import os; os.makedirs("data", exist_ok=True)
+    df = generate(1000)
+    df.to_csv("data/converted_dataset.csv", index=False)
+    print(f"Generated {len(df)} rows")
+    print(df["FDD"].value_counts().sort_index())
